@@ -129,7 +129,7 @@ export async function POST(req: Request) {
 
     // 3. Construir el contenido del Memo
     //    Formato legible e indexable: [AlphaDocere] nombre | SENTIMIENTO | score
-    const memoText = `[CHILEDAO - Hack AlphaDocere] ${name} | ${sentiment} | score:${parseFloat(score).toFixed(2)}`;
+    const memoText = `[AlphaDocere] ${name} | ${sentiment} | score:${parseFloat(score).toFixed(2)}`;
 
     // 4. Conectar a Devnet y obtener el blockhash reciente
     const connection = new Connection(SOLANA_RPC, "confirmed");

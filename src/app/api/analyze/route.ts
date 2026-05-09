@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 
-const NVIDIA_API_KEY = process.env.NVIDIA_API_KEY!;
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY!;
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY!;
 const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "JBFqnCBsd6RMkjVDRZzb";
 
@@ -12,50 +12,55 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "Se requiere texto válido." }, { status: 400 });
     }
 
-    // ── 1. NVIDIA NIM – Llama-3: sentimiento + palabras sugeridas ───────────
-    const nvidiaRes = await fetch(
-      "https://integrate.api.nvidia.com/v1/chat/completions",
+    // ── 1. OpenRouter – Llama-3.1-8b gratis ─────────────────────────────────
+    const t0 = Date.now();
+
+    const openRouterRes = await fetch(
+      "https://openrouter.ai/api/v1/chat/completions",
       {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          Authorization: `Bearer ${NVIDIA_API_KEY}`,
+          "Authorization": `Bearer ${OPENROUTER_API_KEY}`,
+          "HTTP-Referer": "https://animometro.alphadocere.cl",
+          "X-Title": "Animómetro Solana",
         },
         body: JSON.stringify({
-          model: "meta/llama-3.1-8b-instruct",
+          model: "meta-llama/llama-3.1-8b-instruct:free",
           messages: [
             {
               role: "system",
-              content: `Eres un analizador de sentimiento empático. Responde SOLO con un objeto JSON con esta forma exacta:
+              content: `Eres un analizador de sentimiento empático. Responde SOLO con JSON:
 {
   "label": "POSITIVO" | "NEGATIVO" | "NEUTRO",
-  "score": <número entre 0 y 1>,
-  "emoji": "<un solo emoji que represente el estado emocional>",
-  "summary": "<una oración breve y cálida explicando el sentimiento>",
-  "wordSuggestions": ["<palabra1>", "<palabra2>", "<palabra3>", "<palabra4>", "<palabra5>"]
+  "score": <0-1>,
+  "emoji": "<un emoji>",
+  "summary": "<máximo 15 palabras, cálido y directo>",
+  "wordSuggestions": ["<w1>","<w2>","<w3>","<w4>","<w5>"]
 }
-Las wordSuggestions deben ser sustantivos o adjetivos de una sola palabra en español que capturen la esencia emocional del texto. Ejemplos: "Esperanzado", "Agotado", "Tranquilo", "Ansioso", "Agradecido".
-Sin markdown, sin texto extra.`,
+Sin markdown, sin texto extra. El summary debe ser MUY corto (máximo 15 palabras).`,
             },
             {
               role: "user",
-              content: `Analiza el sentimiento de esta respuesta a "¿Cómo te sientes hoy?": "${text}"`,
+              content: `"${text}"`,
             },
           ],
-          temperature: 0.4,
-          max_tokens: 300,
+          temperature: 0.3,
+          max_tokens: 180,
         }),
       }
     );
 
-    if (!nvidiaRes.ok) {
-      const err = await nvidiaRes.text();
-      console.error("NVIDIA NIM error:", err);
-      return NextResponse.json({ error: "Error al llamar NVIDIA NIM.", detail: err }, { status: 502 });
+    if (!openRouterRes.ok) {
+      const err = await openRouterRes.text();
+      console.error("OpenRouter error:", err);
+      return NextResponse.json({ error: "Error al llamar OpenRouter.", detail: err }, { status: 502 });
     }
 
-    const nvidiaData = await nvidiaRes.json();
-    const rawContent = nvidiaData.choices?.[0]?.message?.content ?? "{}";
+    const openRouterData = await openRouterRes.json();
+    console.log(`[timing] OpenRouter: ${Date.now() - t0}ms`);
+
+    const rawContent = openRouterData.choices?.[0]?.message?.content ?? "{}";
 
     let sentiment: {
       label: string;
@@ -69,12 +74,12 @@ Sin markdown, sin texto extra.`,
       const clean = rawContent.replace(/```json|```/g, "").trim();
       sentiment = JSON.parse(clean);
     } catch {
-      console.error("JSON parse error from NIM:", rawContent);
-      return NextResponse.json({ error: "Respuesta inesperada de NIM.", raw: rawContent }, { status: 502 });
+      console.error("JSON parse error:", rawContent);
+      return NextResponse.json({ error: "Respuesta inesperada del modelo.", raw: rawContent }, { status: 502 });
     }
 
-    // ── 2. ElevenLabs – audio con el resumen empático ───────────────────────
-    const ttsText = `${sentiment.summary}`;
+    // ── 2. ElevenLabs – turbo model ──────────────────────────────────────────
+    const t1 = Date.now();
 
     const elevenRes = await fetch(
       `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}`,
@@ -85,9 +90,10 @@ Sin markdown, sin texto extra.`,
           "xi-api-key": ELEVENLABS_API_KEY,
         },
         body: JSON.stringify({
-          text: ttsText,
-          model_id: "eleven_multilingual_v2",
+          text: sentiment.summary,
+          model_id: "eleven_turbo_v2_5",
           voice_settings: { stability: 0.5, similarity_boost: 0.75 },
+          output_format: "mp3_44100_64",
         }),
       }
     );
@@ -100,11 +106,14 @@ Sin markdown, sin texto extra.`,
 
     const audioBuffer = await elevenRes.arrayBuffer();
     const audioBase64 = Buffer.from(audioBuffer).toString("base64");
+    console.log(`[timing] ElevenLabs: ${Date.now() - t1}ms`);
+    console.log(`[timing] Total: ${Date.now() - t0}ms`);
 
     return NextResponse.json({
       sentiment,
       audio: { base64: audioBase64, mimeType: "audio/mpeg" },
     });
+
   } catch (err) {
     console.error("Unexpected error:", err);
     return NextResponse.json({ error: "Error interno del servidor." }, { status: 500 });

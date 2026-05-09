@@ -1,6 +1,9 @@
 "use client";
 
-import { useState, useRef } from "react";
+import { useState, useRef, useCallback, useEffect } from "react";
+import { useWallet, useConnection } from "@solana/wallet-adapter-react";
+import { WalletMultiButton } from "@solana/wallet-adapter-react-ui";
+import { Transaction } from "@solana/web3.js";
 
 type Sentiment = {
   label: "POSITIVO" | "NEGATIVO" | "NEUTRO";
@@ -16,14 +19,7 @@ type AnalyzeResponse = {
   error?: string;
 };
 
-type SolanaActionResponse = {
-  transaction: string;
-  message: string;
-  error?: string;
-};
-
-// Paso actual del flujo
-type Step = "question" | "result" | "word" | "onchain";
+type Step = "question" | "loading" | "result" | "word" | "onchain";
 
 const LABEL_COLORS: Record<string, string> = {
   POSITIVO: "#22c55e",
@@ -31,29 +27,93 @@ const LABEL_COLORS: Record<string, string> = {
   NEUTRO: "#a3a3a3",
 };
 
+// Mensajes de carga por fase — comunican progreso sin mentir
+const LOADING_PHASES = [
+  { message: "Leyendo entre líneas...",        duration: 2800 },
+  { message: "Entendiendo cómo te sientes...", duration: 2800 },
+  { message: "Dándole voz a tu momento...",    duration: 3500 },
+  { message: "Casi listo...",                  duration: 99999 },
+];
+
+function LoadingScreen() {
+  const [phaseIndex, setPhaseIndex] = useState(0);
+
+  useEffect(() => {
+    let i = 0;
+    const advance = () => {
+      i++;
+      if (i < LOADING_PHASES.length) {
+        setPhaseIndex(i);
+        timer = setTimeout(advance, LOADING_PHASES[i].duration);
+      }
+    };
+    let timer = setTimeout(advance, LOADING_PHASES[0].duration);
+    return () => clearTimeout(timer);
+  }, []);
+
+  const phase = LOADING_PHASES[phaseIndex];
+
+  return (
+    <div className="flex flex-col items-center justify-center gap-6 py-12">
+      {/* Pulso animado */}
+      <div className="relative w-16 h-16 flex items-center justify-center">
+        <div className="absolute w-16 h-16 rounded-full bg-zinc-700 animate-ping opacity-20" />
+        <div className="absolute w-10 h-10 rounded-full bg-zinc-600 animate-pulse opacity-40" />
+        <div className="w-6 h-6 rounded-full bg-zinc-300" />
+      </div>
+
+      {/* Mensaje de fase */}
+      <p
+        key={phase.message}
+        className="text-zinc-300 text-sm text-center animate-pulse"
+      >
+        {phase.message}
+      </p>
+
+      {/* Barra de progreso indeterminada */}
+      <div className="w-48 h-0.5 bg-zinc-800 rounded-full overflow-hidden">
+        <div
+          className="h-full bg-zinc-400 rounded-full"
+          style={{
+            animation: "loadbar 1.8s ease-in-out infinite",
+          }}
+        />
+      </div>
+
+      <style>{`
+        @keyframes loadbar {
+          0%   { transform: translateX(-100%) scaleX(0.4); }
+          50%  { transform: translateX(60%)   scaleX(0.8); }
+          100% { transform: translateX(200%)  scaleX(0.4); }
+        }
+      `}</style>
+    </div>
+  );
+}
+
 export default function Home() {
+  const { publicKey, signTransaction, connected } = useWallet();
+  const { connection } = useConnection();
+
   const [step, setStep] = useState<Step>("question");
   const [text, setText] = useState("");
   const [userName, setUserName] = useState("");
-  const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<AnalyzeResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  // Palabra elegida por el usuario para el Memo
   const [chosenWord, setChosenWord] = useState("");
   const [customWord, setCustomWord] = useState("");
 
-  // Solana
-  const [actionLoading, setActionLoading] = useState(false);
-  const [actionResult, setActionResult] = useState<SolanaActionResponse | null>(null);
-  const [actionError, setActionError] = useState<string | null>(null);
+  const [txLoading, setTxLoading] = useState(false);
+  const [txSignature, setTxSignature] = useState<string | null>(null);
+  const [txError, setTxError] = useState<string | null>(null);
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
 
-  // ── Paso 1: Analizar respuesta del usuario ─────────────────────────────────
+  // ── Análisis ───────────────────────────────────────────────────────────────
   async function analyze() {
     if (!text.trim()) return;
-    setLoading(true);
+    setStep("loading");
     setError(null);
 
     try {
@@ -66,6 +126,7 @@ export default function Home() {
 
       if (!res.ok || data.error) {
         setError(data.error ?? "Error desconocido");
+        setStep("question");
       } else {
         setResult(data);
         setStep("result");
@@ -76,79 +137,80 @@ export default function Home() {
       }
     } catch (e) {
       setError("No se pudo conectar con la API.");
+      setStep("question");
       console.error(e);
-    } finally {
-      setLoading(false);
     }
-  }
-
-  // ── Paso 2: Confirmar palabra y pasar al Memo ──────────────────────────────
-  function confirmWord() {
-    const word = customWord.trim() || chosenWord;
-    if (!word) return;
-    setStep("onchain");
   }
 
   const finalWord = customWord.trim() || chosenWord;
 
-  // ── Paso 3: Obtener transacción Memo ───────────────────────────────────────
-  async function fetchMemoTransaction() {
-    if (!result || !finalWord) return;
-    setActionLoading(true);
-    setActionResult(null);
-    setActionError(null);
+  // ── Enviar Memo a Solana ───────────────────────────────────────────────────
+  const sendMemo = useCallback(async () => {
+    if (!result || !finalWord || !publicKey || !signTransaction) return;
 
-    const { label, score, emoji } = result.sentiment;
-    const memoLabel = `${emoji} ${finalWord} | ${label}`;
-
-    const params = new URLSearchParams({
-      name: userName.trim() || "Anónimo",
-      sentiment: memoLabel,
-      score: score.toFixed(4),
-    });
+    setTxLoading(true);
+    setTxSignature(null);
+    setTxError(null);
 
     try {
-      const DEMO_ACCOUNT = process.env.NEXT_PUBLIC_DEMO_ACCOUNT ?? "";
+      const { label, score, emoji } = result.sentiment;
+      const params = new URLSearchParams({
+        name: userName.trim() || "Anónimo",
+        sentiment: `${emoji} ${finalWord} | ${label}`,
+        score: score.toFixed(4),
+      });
+
       const res = await fetch(`/api/actions/memo?${params.toString()}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ account: DEMO_ACCOUNT }),
+        body: JSON.stringify({ account: publicKey.toBase58() }),
       });
 
-      const data = await res.json();
-      if (!res.ok || data.message?.includes("Error")) {
-        setActionError(data.message ?? "Error al construir la transacción.");
-      } else {
-        setActionResult(data as SolanaActionResponse);
+      if (!res.ok) {
+        const data = await res.json();
+        throw new Error(data.message ?? "Error construyendo la transacción");
       }
-    } catch (e) {
-      setActionError("No se pudo conectar con el endpoint de la Action.");
-      console.error(e);
+
+      const { transaction: txBase64 } = await res.json();
+      const txBuffer = Buffer.from(txBase64, "base64");
+      const transaction = Transaction.from(txBuffer);
+
+      const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
+      transaction.recentBlockhash = blockhash;
+      transaction.feePayer = publicKey;
+
+      const signed = await signTransaction(transaction);
+      const signature = await connection.sendRawTransaction(signed.serialize());
+      await connection.confirmTransaction({ signature, blockhash, lastValidBlockHeight });
+
+      setTxSignature(signature);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "Error desconocido";
+      setTxError(msg.includes("User rejected") ? "Firmado cancelado." : msg);
     } finally {
-      setActionLoading(false);
+      setTxLoading(false);
     }
-  }
+  }, [result, finalWord, publicKey, signTransaction, connection, userName]);
 
-  const labelColor = result
-    ? (LABEL_COLORS[result.sentiment.label] ?? "#a3a3a3")
-    : "#a3a3a3";
+  const labelColor = result ? (LABEL_COLORS[result.sentiment.label] ?? "#a3a3a3") : "#a3a3a3";
 
-  // ── Render ─────────────────────────────────────────────────────────────────
   return (
     <main className="min-h-screen bg-zinc-950 text-zinc-100 flex flex-col items-center justify-center p-6 font-mono">
       <div className="w-full max-w-lg space-y-6">
 
         {/* Header */}
-        <div className="border-b border-zinc-800 pb-4">
-          <h1 className="text-xl font-bold tracking-tight text-white">
-            ¿Cómo te sientes hoy?
-          </h1>
-          <p className="text-zinc-600 text-xs mt-1">
-            Llama-3 · ElevenLabs · Solana Devnet
-          </p>
+        <div className="border-b border-zinc-800 pb-4 flex items-start justify-between">
+          <div>
+            <h1 className="text-xl font-bold tracking-tight text-white">¿Cómo te sientes hoy?</h1>
+            <p className="text-zinc-600 text-xs mt-1">Llama-3 · ElevenLabs · Solana Devnet</p>
+          </div>
+          <WalletMultiButton style={{ fontSize: "12px", height: "36px", padding: "0 14px" }} />
         </div>
 
-        {/* ── STEP: question ── */}
+        {/* ── LOADING ── */}
+        {step === "loading" && <LoadingScreen />}
+
+        {/* ── QUESTION ── */}
         {step === "question" && (
           <div className="space-y-3">
             <input
@@ -164,24 +226,20 @@ export default function Home() {
               rows={4}
               className="w-full bg-zinc-900 border border-zinc-700 rounded-md p-3 text-sm text-zinc-100 placeholder-zinc-600 resize-none focus:outline-none focus:border-zinc-500 transition-colors"
             />
-            {error && (
-              <p className="text-red-400 text-xs">{error}</p>
-            )}
+            {error && <p className="text-red-400 text-xs">{error}</p>}
             <button
               onClick={analyze}
-              disabled={loading || !text.trim()}
+              disabled={!text.trim()}
               className="w-full bg-white text-zinc-950 font-semibold text-sm py-2.5 rounded-md hover:bg-zinc-200 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
             >
-              {loading ? "Analizando..." : "Compartir →"}
+              Compartir →
             </button>
           </div>
         )}
 
-        {/* ── STEP: result ── */}
+        {/* ── RESULT ── */}
         {step === "result" && result && (
           <div className="space-y-4">
-
-            {/* Emoji + label */}
             <div
               className="rounded-md px-4 py-4 flex items-center gap-3"
               style={{ backgroundColor: `${labelColor}15`, border: `1px solid ${labelColor}30` }}
@@ -191,27 +249,19 @@ export default function Home() {
                 <p className="text-xs text-zinc-500 uppercase tracking-widest mb-0.5">
                   {result.sentiment.label} · {Math.round(result.sentiment.score * 100)}%
                 </p>
-                <p className="text-zinc-200 text-sm leading-snug">
-                  {result.sentiment.summary}
-                </p>
+                <p className="text-zinc-200 text-sm leading-snug">{result.sentiment.summary}</p>
               </div>
             </div>
 
-            {/* Score bar */}
             <div className="h-1 bg-zinc-800 rounded-full overflow-hidden">
               <div
                 className="h-full rounded-full transition-all duration-700"
-                style={{
-                  width: `${Math.round(result.sentiment.score * 100)}%`,
-                  backgroundColor: labelColor,
-                }}
+                style={{ width: `${Math.round(result.sentiment.score * 100)}%`, backgroundColor: labelColor }}
               />
             </div>
 
-            {/* Audio */}
             <audio ref={audioRef} controls className="w-full" />
 
-            {/* Siguiente paso */}
             <button
               onClick={() => setStep("word")}
               className="w-full border border-zinc-700 text-zinc-300 text-sm py-2.5 rounded-md hover:border-zinc-500 hover:text-white transition-colors"
@@ -221,14 +271,11 @@ export default function Home() {
           </div>
         )}
 
-        {/* ── STEP: word ── */}
+        {/* ── WORD ── */}
         {step === "word" && result && (
           <div className="space-y-4">
-            <p className="text-zinc-400 text-sm">
-              La IA sugiere estas palabras para describir tu momento. Elige una o escribe la tuya:
-            </p>
+            <p className="text-zinc-400 text-sm">Elige una palabra sugerida o escribe la tuya:</p>
 
-            {/* Sugerencias */}
             <div className="flex flex-wrap gap-2">
               {result.sentiment.wordSuggestions.map((w) => (
                 <button
@@ -245,7 +292,6 @@ export default function Home() {
               ))}
             </div>
 
-            {/* Palabra propia */}
             <input
               value={customWord}
               onChange={(e) => { setCustomWord(e.target.value); setChosenWord(""); }}
@@ -253,8 +299,7 @@ export default function Home() {
               className="w-full bg-zinc-900 border border-zinc-700 rounded-md px-3 py-2 text-sm text-zinc-100 placeholder-zinc-600 focus:outline-none focus:border-zinc-500 transition-colors"
             />
 
-            {/* Preview del Memo */}
-            {(chosenWord || customWord) && (
+            {finalWord && (
               <div className="bg-zinc-900 border border-zinc-800 rounded-md px-3 py-2">
                 <p className="text-zinc-500 text-xs mb-1">Se guardará en Solana como:</p>
                 <code className="text-zinc-300 text-sm">
@@ -264,77 +309,72 @@ export default function Home() {
             )}
 
             <button
-              onClick={confirmWord}
+              onClick={() => finalWord && setStep("onchain")}
               disabled={!finalWord}
               className="w-full bg-white text-zinc-950 font-semibold text-sm py-2.5 rounded-md hover:bg-zinc-200 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
             >
-              Confirmar palabra →
+              Confirmar →
             </button>
 
-            <button
-              onClick={() => setStep("result")}
-              className="w-full text-zinc-600 text-xs hover:text-zinc-400 transition-colors"
-            >
+            <button onClick={() => setStep("result")} className="w-full text-zinc-600 text-xs hover:text-zinc-400 transition-colors">
               ← Volver
             </button>
           </div>
         )}
 
-        {/* ── STEP: onchain ── */}
+        {/* ── ONCHAIN ── */}
         {step === "onchain" && result && (
           <div className="space-y-4">
-
-            {/* Resumen de lo que se va a guardar */}
             <div className="bg-zinc-900 border border-zinc-800 rounded-md px-4 py-3 space-y-1">
               <p className="text-zinc-500 text-xs uppercase tracking-widest">Memo on-chain</p>
-              <p className="text-white text-lg">
-                {result.sentiment.emoji} {finalWord}
-              </p>
+              <p className="text-white text-2xl">{result.sentiment.emoji} {finalWord}</p>
               <p className="text-zinc-500 text-xs">
-                {userName || "Anónimo"} · {result.sentiment.label} · score {Math.round(result.sentiment.score * 100)}%
+                {userName || "Anónimo"} · {result.sentiment.label} · {Math.round(result.sentiment.score * 100)}%
               </p>
             </div>
 
-            <button
-              onClick={fetchMemoTransaction}
-              disabled={actionLoading}
-              className="w-full border border-zinc-600 text-zinc-200 font-semibold text-sm py-2.5 rounded-md hover:border-zinc-400 hover:text-white disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
-            >
-              {actionLoading ? "Construyendo transacción..." : "⬡ Registrar en Solana Devnet"}
-            </button>
-
-            {actionError && (
-              <p className="text-red-400 text-xs">{actionError}</p>
+            {!connected && (
+              <div className="bg-zinc-900 border border-yellow-900/50 rounded-md px-4 py-3 space-y-2">
+                <p className="text-yellow-400 text-xs">Conecta tu wallet para firmar</p>
+                <WalletMultiButton style={{ fontSize: "12px", height: "32px", width: "100%" }} />
+              </div>
             )}
 
-            {actionResult && (
-              <div className="bg-zinc-900 border border-zinc-800 rounded-md p-3 space-y-2">
-                <p className="text-green-400 text-xs font-semibold">✓ Transacción construida</p>
-                <p className="text-zinc-300 text-xs">{actionResult.message}</p>
-                <div className="bg-zinc-950 rounded p-2 max-h-20 overflow-y-auto">
-                  <code className="text-zinc-500 text-xs break-all">{actionResult.transaction}</code>
-                </div>
+            {connected && publicKey && (
+              <p className="text-zinc-500 text-xs">
+                Wallet: <span className="text-zinc-300">{publicKey.toBase58().slice(0, 8)}...{publicKey.toBase58().slice(-6)}</span>
+              </p>
+            )}
+
+            <button
+              onClick={sendMemo}
+              disabled={txLoading || !connected || !!txSignature}
+              className="w-full border border-zinc-600 text-zinc-200 font-semibold text-sm py-2.5 rounded-md hover:border-zinc-400 hover:text-white disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+            >
+              {txLoading ? "Esperando firma..." : txSignature ? "✓ Guardado" : "⬡ Firmar y enviar a Solana"}
+            </button>
+
+            {txError && <p className="text-red-400 text-xs">{txError}</p>}
+
+            {txSignature && (
+              <div className="bg-zinc-900 border border-green-900/50 rounded-md p-3 space-y-2">
+                <p className="text-green-400 text-xs font-semibold">✓ Confirmado en Devnet</p>
                 <a
-                  href="https://explorer.solana.com/?cluster=devnet"
+                  href={`https://explorer.solana.com/tx/${txSignature}?cluster=devnet`}
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="block text-xs text-zinc-500 underline hover:text-zinc-300 transition-colors"
+                  className="block text-xs text-zinc-400 underline hover:text-white transition-colors"
                 >
-                  Ver en Solana Explorer (Devnet) →
+                  Ver en Solana Explorer →
                 </a>
               </div>
             )}
 
-            {/* Empezar de nuevo */}
             <button
               onClick={() => {
-                setStep("question");
-                setText("");
-                setResult(null);
-                setChosenWord("");
-                setCustomWord("");
-                setActionResult(null);
-                setActionError(null);
+                setStep("question"); setText(""); setResult(null);
+                setChosenWord(""); setCustomWord("");
+                setTxSignature(null); setTxError(null);
               }}
               className="w-full text-zinc-600 text-xs hover:text-zinc-400 transition-colors"
             >
